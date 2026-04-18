@@ -100,6 +100,14 @@ foreach(variant ${CPU_VARIANTS})
     endif()
 endforeach()
 
+foreach(variant ${CPU_VARIANTS})
+    if(TARGET ${variant})
+        target_compile_options(${variant} PRIVATE
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-march=native>
+        )
+    endif()
+endforeach()
+
 install(TARGETS ggml-base ${CPU_VARIANTS}
     RUNTIME_DEPENDENCIES
         PRE_EXCLUDE_REGEXES ".*"

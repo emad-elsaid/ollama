@@ -14,12 +14,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -41,6 +44,12 @@ import (
 
 	_ "github.com/ollama/ollama/model/models"
 )
+
+// pprofRequestN is incremented for each profiled completion request to generate unique filenames.
+var pprofRequestN atomic.Int64
+
+// pprofMu ensures only one CPU profile runs at a time (runtime limitation).
+var pprofMu sync.Mutex
 
 // response contains a piece of generated text along with optional logprobs
 type response struct {
@@ -385,6 +394,9 @@ type Server struct {
 	// multimodalHash generates hashes for comparing equality
 	// of non-text data
 	multimodalHash maphash.Hash
+
+	// logitsBuf is reused across decode steps to avoid per-request allocations
+	logitsBuf []float32
 }
 
 func (s *Server) allNil() bool {
@@ -720,7 +732,8 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		},
 		activeBatch.modelOutput)
 
-	outputs := activeBatch.modelOutput.Floats()
+	s.logitsBuf = activeBatch.modelOutput.FloatsInto(s.logitsBuf)
+	outputs := s.logitsBuf
 	t := time.Now()
 
 	logutil.Trace("computeBatch: logits ready", "batchID", activeBatch.id)
@@ -876,6 +889,11 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Start per-request pprof profiles when OLLAMA_PPROF_DIR is set.
+	// Only one CPU profile can run at a time; concurrent requests skip profiling.
+	stopProfile := startRequestProfile()
+	defer stopProfile()
+
 	var grammar *sample.GrammarSampler
 	var err error
 	if req.Grammar != "" {
@@ -970,6 +988,9 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 
 				flusher.Flush()
 			} else {
+				// LLM has finished generating — stop profiling before flushing the final response.
+				stopProfile()
+
 				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
 					Done:               true,
 					DoneReason:         seq.doneReason,
@@ -1397,6 +1418,55 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("gathering device infos took", "duration", time.Since(startDevices))
 	if err := json.NewEncoder(w).Encode(&infos); err != nil {
 		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
+	}
+}
+
+// startRequestProfile begins a CPU profile for a single completion request when
+// OLLAMA_PPROF_DIR is set. It returns a stop function that writes the CPU profile
+// and a heap snapshot to that directory, then releases the profiling lock.
+// The returned function is idempotent — safe to call more than once.
+func startRequestProfile() func() {
+	dir := envconfig.Var("OLLAMA_PPROF_DIR")
+	if dir == "" || !pprofMu.TryLock() {
+		return func() {}
+	}
+
+	n := pprofRequestN.Add(1)
+	cpuPath := filepath.Join(dir, fmt.Sprintf("cpu_%04d.prof", n))
+	memPath := filepath.Join(dir, fmt.Sprintf("mem_%04d.prof", n))
+
+	cpuFile, err := os.Create(cpuPath)
+	if err != nil {
+		slog.Warn("pprof: failed to create CPU profile", "path", cpuPath, "err", err)
+		pprofMu.Unlock()
+		return func() {}
+	}
+
+	if err := pprof.StartCPUProfile(cpuFile); err != nil {
+		slog.Warn("pprof: failed to start CPU profile", "err", err)
+		cpuFile.Close()
+		pprofMu.Unlock()
+		return func() {}
+	}
+
+	slog.Info("pprof: profiling request", "n", n, "cpu", cpuPath, "mem", memPath)
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			pprof.StopCPUProfile()
+			cpuFile.Close()
+
+			if mf, err := os.Create(memPath); err != nil {
+				slog.Warn("pprof: failed to create heap profile", "path", memPath, "err", err)
+			} else {
+				pprof.WriteHeapProfile(mf)
+				mf.Close()
+			}
+
+			pprofMu.Unlock()
+			slog.Info("pprof: profiles written", "n", n)
+		})
 	}
 }
 

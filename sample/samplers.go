@@ -23,6 +23,7 @@ type Sampler struct {
 	minP        float32
 	temperature float32
 	grammar     *GrammarSampler
+	tokenBuf    []token
 }
 
 func (s *Sampler) Sample(logits []float32) (int32, error) {
@@ -30,7 +31,10 @@ func (s *Sampler) Sample(logits []float32) (int32, error) {
 		return -1, errors.New("sample: no logits provided to sample")
 	}
 
-	tokens := make([]token, len(logits))
+	if cap(s.tokenBuf) < len(logits) {
+		s.tokenBuf = make([]token, len(logits))
+	}
+	tokens := s.tokenBuf[:len(logits)]
 	for i := range logits {
 		tokens[i].id = int32(i)
 		tokens[i].value = logits[i]
