@@ -16,3 +16,7 @@ llama/build
 llama/vendor
 /ollama
 integration/testdata/models/
+
+# Profiling and test artifacts
+*.prof
+*.test

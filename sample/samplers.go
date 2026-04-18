@@ -169,7 +169,8 @@ func NewSampler(temperature float32, topK int, topP float32, minP float32, seed 
 }
 
 type GrammarSampler struct {
-	grammar *llama.Grammar
+	grammar      *llama.Grammar
+	tokenDataBuf []llama.TokenData // Reusable buffer for Apply (OPT-11)
 }
 
 func NewGrammarSampler(tok tokenizer.Tokenizer, grammarStr string) (*GrammarSampler, error) {
@@ -189,7 +190,12 @@ func NewGrammarSampler(tok tokenizer.Tokenizer, grammarStr string) (*GrammarSamp
 }
 
 func (g *GrammarSampler) Apply(tokens []token) {
-	tds := make([]llama.TokenData, len(tokens))
+	// Reuse buffer to avoid per-token allocation (OPT-11)
+	if cap(g.tokenDataBuf) < len(tokens) {
+		g.tokenDataBuf = make([]llama.TokenData, len(tokens))
+	}
+	tds := g.tokenDataBuf[:len(tokens)]
+
 	for i, token := range tokens {
 		tds[i].ID = token.id
 		tds[i].Logit = token.value
